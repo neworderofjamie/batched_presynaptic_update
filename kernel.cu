@@ -40,12 +40,14 @@ using HostDeviceArray = std::pair < T*, T* > ;
 enum Mode
 {
     ModeSparsePost,
+    ModeSparsePostBitfield,
     ModeMax,
 };
 
 
 const char *const s_ModeNames[] = {
-    "Sparse Post"};
+    "Sparse Post",
+    "Sparse Post Bitfield"};
 
 //------------------------------------------------------------------------
 // SparseMatrix
@@ -91,6 +93,20 @@ private:
     std::chrono::time_point<std::chrono::high_resolution_clock> m_Start;
     std::string m_Title;
 };
+
+//! Divide two integers, rounding up i.e. effectively taking ceil
+template<typename A, typename B, typename = std::enable_if_t<std::is_integral_v<A> && std::is_integral_v<B>>>
+inline auto ceilDivide(A numerator, B denominator)
+{
+    return ((numerator + denominator - 1) / denominator);
+}
+
+//! Pad an integer to a multiple of another
+template<typename A, typename B, typename = std::enable_if_t<std::is_integral_v<A>&& std::is_integral_v<B>>>
+inline auto padSize(A size, B blockSize)
+{
+    return ceilDivide(size, blockSize) * blockSize;
+}
 
 //-----------------------------------------------------------------------------
 // Device functions
@@ -194,6 +210,32 @@ __global__ void poisson(unsigned int numPoisson, const float *d_meanISI, curandS
     }
 }
 //-----------------------------------------------------------------------------
+// Kernel to simulate population of poisson neurons
+__global__ void poissonBitfield(unsigned int numPoisson, const float *d_meanISI, curandState *d_poissonState,
+                                float *d_timeToSpike, uint32_t *d_outSpikes)
+{
+    // Get index of neuron in population
+    const int i = threadIdx.x + (blockIdx.x * blockDim.x);
+    const unsigned int batch = blockIdx.y;
+
+
+    // If there is a neuron for this thread to simulate
+    const unsigned int batchOffset = numPoisson * batch;
+    const unsigned int numBatchWords = (blockDim.y + 31) / 32;
+    if (i < numPoisson) {
+        float tts = d_timeToSpike[batchOffset + i];
+
+        if (tts <= 0.0f) {
+            tts += (d_meanISI[batchOffset + i] * exponentialDist(d_poissonState[batchOffset + i]));
+
+            // Set bit in spike bitfield
+            atomicOr(&d_outSpikes[(i * numBatchWords) + (batch / 32)], 1 << (batch % 32));
+        }
+
+        d_timeToSpike[batchOffset + i] = (tts - 1.0f);
+    }
+}
+//-----------------------------------------------------------------------------
 __global__ void sparsePostIndividualWeight(const unsigned int *d_rowLength, const unsigned int *d_indices, 
                                            unsigned int numPre, unsigned int numPost, unsigned int maxRowLength,
                                            const unsigned int *d_numInSpikes, const unsigned int *d_inSpikes,
@@ -249,86 +291,91 @@ __global__ void sparsePostIndividualWeight(const unsigned int *d_rowLength, cons
     }
 }
 //-----------------------------------------------------------------------------
-__global__ void fixedProbabilitySkipConstant(float probabilityReciprocal, unsigned int numPre, unsigned int numPost, unsigned int numPostThreads,
-                                             const curandState *d_rowState,
-                                             const unsigned int *d_numInSpikes, const unsigned int *d_inSpikes,
-                                             float *d_outCurrents)
+__global__ void sparsePostBitfieldIndividualWeight(const unsigned int *d_rowLength, const unsigned int *d_indices, 
+                                                   unsigned int batchSize, unsigned int numPre, unsigned int numPost, unsigned int maxRowLength,
+                                                   const uint32_t *d_inSpikes, const float *d_weights, float *d_outCurrents)
 {
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
-    const unsigned int i = id / numPostThreads;
-    const unsigned int j = id % numPostThreads;
+    const unsigned int spikeWord = blockIdx.y;
+    const unsigned int numBatchWords = (batchSize + 31) / 32;
+     
+    assert(numBatchWords == 1);
 
-    if (i < d_numInSpikes[0]) {
-        // Copy row state corresponding to spike into register
-        // **PROFILING** d_inSpikes[spkIdx] is nicely coalesced
-        // **HOWEVER** d_rowState is not - if neurons fire at 10Hz on average only 1/100 will spike meaing this won't coalesce well
-        curandState localState = d_rowState[(d_inSpikes[i] * numPostThreads) + j];
+   
+    // Loop through presynaptic neurons in spike word
+    // **THINK** could move to neuron
+    uint32_t allBatchSpikeWord = 0;
+    for(unsigned int i = 0; i < 32; i++) {
+        // Get word indicating which batches this neuron spiked in
+        // **TODO** reduce across multiple thread to handle batchSizes > 32
+        const uint32_t spikeBatchWord = d_inSpikes[((spikeWord * 32) + i) * numBatchWords];
 
-        const unsigned int numPostPerThread = (unsigned int)ceilf((float)numPost / (float)numPostThreads);
-
-        // Loop through columns
-        const unsigned int postStart = j * numPostPerThread;
-        const unsigned int postEnd = min(postStart + numPostPerThread, numPost);
-
-
-        // Loop through columns
-        for (int j = postStart - 1;;)
-        {
-            // Draw from uniform
-            const float u = curand_uniform(&localState);
-
-            j += (1 + (int)(__logf(u) * probabilityReciprocal));
-            if (j < postEnd) {
-                // Add input current
-                atomicAdd(&d_outCurrents[j], 1.0f);
-            }
-            else {
-                break;
-            }
-
+        // If neurons in any batches spikes, set bit
+        if(spikeBatchWord != 0) {
+            allBatchSpikeWord |= (1 << i);
         }
     }
-}
-//-----------------------------------------------------------------------------
-__global__ void fixedProbabilitySkipUniform(float probabilityReciprocal, unsigned int numPre, unsigned int numPost, unsigned int numPostThreads,
-                                            const curandState *d_rowState,
-                                            const unsigned int *d_numInSpikes, const unsigned int *d_inSpikes,
-                                            float *d_outCurrents)
-{
-    const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
-    const unsigned int i = id / numPostThreads;
-    const unsigned int j = id % numPostThreads;
+    /*uint32_t allBatchSpikeWord = d_inSpikes[(spikeWord * numBatchWords) + (threadIdx.x % 32)];
+    allBatchSpikeWord |= __shfl_down_sync(0xFFFFFFFF, lOutPre, 16);
+    allBatchSpikeWord |= __shfl_down_sync(0xFFFFFFFF, lOutPre, 8);
+    allBatchSpikeWord |= __shfl_down_sync(0xFFFFFFFF, lOutPre, 4);
+    allBatchSpikeWord |= __shfl_down_sync(0xFFFFFFFF, lOutPre, 2);
+    allBatchSpikeWord |= __shfl_down_sync(0xFFFFFFFF, lOutPre, 1);*/
 
-    if (i < d_numInSpikes[0]) {
-        // Copy row state corresponding to spike into register
-        // **PROFILING** d_inSpikes[spkIdx] is nicely coalesced
-        // **HOWEVER** d_rowState is not - if neurons fire at 10Hz on average only 1/100 will spike meaing this won't coalesce well
-        curandState localState = d_rowState[(d_inSpikes[i] * numPostThreads) + j];
+    // Calculate neuron id of highest bit of this word
+    unsigned int preNeuronID = (spikeWord * 32) + 31;
 
-        const unsigned int numPostPerThread = (unsigned int)ceilf((float)numPost / (float)numPostThreads);
+    // While there are rows with any spikes
+    // **NOTE** will not diverge across whole grid
+    while(allBatchSpikeWord != 0) {
+        // Calculate leading zeros
+        const int numNeuronLZ = __clz(allBatchSpikeWord);
+                
+        // If all bits have now been processed, zero spike word
+        // Otherwise shift past the spike we have found
+        allBatchSpikeWord = (numNeuronLZ == 31) ? 0 : (allBatchSpikeWord << (numNeuronLZ + 1));
+                
+        // Subtract number of leading zeros from neuron ID
+        preNeuronID -= numNeuronLZ;
+        
+        // If there is a synapse for this thread to process
+        if(id < d_rowLength[preNeuronID]) {
+            // Get postsynaptic index
+            const unsigned int synAddress = (preNeuronID * maxRowLength) + id;
+            const unsigned int j = d_indices[synAddress];
+            const float weight = d_weights[synAddress];
 
-        // Loop through columns
-        const unsigned int postStart = j * numPostPerThread;
-        const unsigned int postEnd = min(postStart + numPostPerThread, numPost);
+            // Loop through all words containing bits for neurons in each batch
+            for(unsigned int i = 0; i < numBatchWords; i++) {
+                unsigned int batchSpikeWord = d_inSpikes[(preNeuronID * numBatchWords) + i];
 
+                // Calculate neuron id of highest bit of this word
+                unsigned int batch = (i * 32) + 31;
 
-        // Loop through columns
-        for (int j = postStart - 1;;)
-        {
-            // Draw from uniform
-            const float u = curand_uniform(&localState);
-            const float w = curand_uniform(&localState);
+                // While there are more batches where this neuron spikes
+                while(batchSpikeWord != 0) {
+                    // Calculate leading zeros
+                    const int numBatchLZ = __clz(batchSpikeWord);
 
-            j += (1 + (int)(__logf(u) * probabilityReciprocal));
-            if (j < postEnd) {
-                // Add input current
-                atomicAdd(&d_outCurrents[j], (w * 0.7f) + 0.1f);
+                    // If all bits have now been processed, zero spike word
+                    // Otherwise shift past the spike we have found
+                    batchSpikeWord = (numBatchLZ == 31) ? 0 : (batchSpikeWord << (numBatchLZ + 1));
+                
+                    // Subtract number of leading zeros from neuron ID
+                    batch -= numBatchLZ;
+
+                    // Add input current
+                    const unsigned int postBatchOffset = numPost * batch;
+                    atomicAdd(&d_outCurrents[postBatchOffset + j], weight);
+
+                    // New batch id of the highest bit of this word
+                    batch--;
+                }
             }
-            else {
-                break;
-            }
-
         }
+
+        // New neuron id of the highest bit of this word
+        preNeuronID--;
     }
 }
 
@@ -563,8 +610,9 @@ int main(int argc, char *argv[])
             blockSize = std::stoul(argv[4]);
         }
 
-        const unsigned int preBlocks = (unsigned int)std::ceil((float)numPre / (float)blockSize);
-        const unsigned int preBatchBlocks = (unsigned int)std::ceil((float)(numPre * batchSize) / (float)blockSize);
+        const unsigned int preBlocks = ceilDivide(numPre, blockSize);
+        const unsigned int preBatchBlocks = ceilDivide(numPre * batchSize, blockSize);
+        const unsigned int numBatchWords = ceilDivide(batchSize, 32);
         std::cout << "Mode:" << s_ModeNames[mode] << ", pre:" << numPre << ", num post:" << numPost << ", batch size:" << batchSize << ", block size:" << blockSize << std::endl;
     
         CHECK_CUDA_ERRORS(cudaSetDevice(0));
@@ -601,11 +649,24 @@ int main(int argc, char *argv[])
         //------------------------------------------------------------------------
         // Configure poisson population
         //------------------------------------------------------------------------
-        // Create arrays to hold poisson spike count
-        auto poissonNumSpikes = allocateHostDevice<unsigned int>(batchSize);
+        HostDeviceArray<unsigned int> poissonNumSpikes;
+        HostDeviceArray<unsigned int> poissonSpikes;
+        HostDeviceArray<uint32_t> poissonSpikeBits;
 
-        // Create arrays to hold poisson spikes
-        auto poissonSpikes = allocateHostDevice<unsigned int>(numPre * batchSize);
+        if(mode == ModeSparsePost) {
+            // Create arrays to hold poisson spike count
+            poissonNumSpikes = allocateHostDevice<unsigned int>(batchSize);
+
+            // Create arrays to hold poisson spikes
+            poissonSpikes = allocateHostDevice<unsigned int>(numPre * batchSize);
+        }
+        else if(mode == ModeSparsePostBitfield) {
+            poissonSpikeBits = allocateHostDevice<uint32_t>(numBatchWords * numPre);
+        }
+        else {
+            assert(false);
+        }
+
 
         // Create arrays to hold poisson interspike intervals
         // **THINK** why not constant?
@@ -647,25 +708,33 @@ int main(int argc, char *argv[])
         {
             // Loop through time
             for (unsigned int t = 0; t < 5000; t++) {
-                std::fill_n(&poissonNumSpikes.first[0], batchSize, 0);
-                hostToDeviceCopy(poissonNumSpikes, batchSize);
-
                 // Simulate poisson population
                 {
                     const dim3 threads(blockSize, 1);
                     const dim3 grid(preBlocks, batchSize);
-                    const unsigned int sharedBytes = blockSize * sizeof(unsigned int);
-                    poisson <<<grid, threads, sharedBytes>>>(numPre, poissonMeanISI.second, d_poissonState,
-                                                             d_poissonTimeToSpike, poissonNumSpikes.second, poissonSpikes.second);
+
+                    if(mode == ModeSparsePost) {
+                        // Zero spike count
+                        std::fill_n(&poissonNumSpikes.first[0], batchSize, 0);
+                        hostToDeviceCopy(poissonNumSpikes, batchSize);
+
+                        const unsigned int sharedBytes = blockSize * sizeof(unsigned int);
+                        poisson <<<grid, threads, sharedBytes>>>(numPre, poissonMeanISI.second, d_poissonState,
+                                                                 d_poissonTimeToSpike, poissonNumSpikes.second, poissonSpikes.second);
+                    }
+                    else if(mode == ModeSparsePostBitfield) {
+                        // Clear spike bits
+                        std::fill_n(&poissonSpikeBits.first[0], numBatchWords * numPre, 0);
+                        hostToDeviceCopy(poissonSpikeBits, numBatchWords * numPre);
+
+                        poissonBitfield<<<grid, threads>>>(numPre, poissonMeanISI.second, d_poissonState,
+                                                           d_poissonTimeToSpike, poissonSpikeBits.second);
+                    }
+
                 }
-
-                // Copy spikes back to host
-                deviceToHostCopy(poissonNumSpikes, 1);
-            
                 CHECK_CUDA_ERRORS(cudaEventRecord(kernelStartEvent));
+                const unsigned int numPostSynapseBlocks = ceilDivide(sparseMatrix.maxRowLength, blockSize);
                 if(mode == ModeSparsePost) {
-                    const unsigned int numPostSynapseBlocks = (unsigned int)std::ceil((float)sparseMatrix.maxRowLength / (float)blockSize);
-
                     const dim3 threads(blockSize, 1);
                     const dim3 grid(numPostSynapseBlocks, batchSize);
                     const unsigned int sharedBytes = blockSize * 2 * sizeof(unsigned int);
@@ -673,6 +742,13 @@ int main(int argc, char *argv[])
                                                                                numPre, numPost, sparseMatrix.maxRowLength,
                                                                                poissonNumSpikes.second, poissonSpikes.second,
                                                                                weights.second, outCurrents.second);
+                }
+                else if(mode == ModeSparsePostBitfield) {
+                    const dim3 threads(blockSize, 1);
+                    const dim3 grid(numPostSynapseBlocks, ceilDivide(numPre, 32));
+                    sparsePostBitfieldIndividualWeight<<<grid, threads>>>(sparseMatrix.rowLength.second, sparseMatrix.indices.second, 
+                                                                          batchSize, numPre, numPost, sparseMatrix.maxRowLength,
+                                                                          poissonSpikeBits.second, weights.second, outCurrents.second);
                 }
 
                 CHECK_CUDA_ERRORS(cudaEventRecord(kernelEndEvent));
