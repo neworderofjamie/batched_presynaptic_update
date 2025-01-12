@@ -301,26 +301,15 @@ __global__ void sparsePostBitfieldIndividualWeight(const unsigned int *d_rowLeng
      
     assert(numBatchWords == 1);
 
-   
-    // Loop through presynaptic neurons in spike word
-    // **THINK** could move to neuron
-    uint32_t allBatchSpikeWord = 0;
-    for(unsigned int i = 0; i < 32; i++) {
-        // Get word indicating which batches this neuron spiked in
-        // **TODO** reduce across multiple thread to handle batchSizes > 32
-        const uint32_t spikeBatchWord = d_inSpikes[((spikeWord * 32) + i) * numBatchWords];
+    // **TODO** parallelise across numBatchWords
 
-        // If neurons in any batches spikes, set bit
-        if(spikeBatchWord != 0) {
-            allBatchSpikeWord |= (1 << i);
-        }
-    }
-    /*uint32_t allBatchSpikeWord = d_inSpikes[(spikeWord * numBatchWords) + (threadIdx.x % 32)];
-    allBatchSpikeWord |= __shfl_down_sync(0xFFFFFFFF, lOutPre, 16);
-    allBatchSpikeWord |= __shfl_down_sync(0xFFFFFFFF, lOutPre, 8);
-    allBatchSpikeWord |= __shfl_down_sync(0xFFFFFFFF, lOutPre, 4);
-    allBatchSpikeWord |= __shfl_down_sync(0xFFFFFFFF, lOutPre, 2);
-    allBatchSpikeWord |= __shfl_down_sync(0xFFFFFFFF, lOutPre, 1);*/
+    // Parallelising across warps, determine if there were spikes in any batch for each postsynaptic neuron
+    uint32_t allBatchSpikeWord = (d_inSpikes[((spikeWord * 32) + (threadIdx.x % 32)) * numBatchWords] == 0) ? 0 : (1 << (threadIdx.x % 32));
+    allBatchSpikeWord |= __shfl_xor_sync(0xFFFFFFFF, allBatchSpikeWord, 1);
+    allBatchSpikeWord |= __shfl_xor_sync(0xFFFFFFFF, allBatchSpikeWord, 2);
+    allBatchSpikeWord |= __shfl_xor_sync(0xFFFFFFFF, allBatchSpikeWord, 4);
+    allBatchSpikeWord |= __shfl_xor_sync(0xFFFFFFFF, allBatchSpikeWord, 8);
+    allBatchSpikeWord |= __shfl_xor_sync(0xFFFFFFFF, allBatchSpikeWord, 16);
 
     // Calculate neuron id of highest bit of this word
     unsigned int preNeuronID = (spikeWord * 32) + 31;
