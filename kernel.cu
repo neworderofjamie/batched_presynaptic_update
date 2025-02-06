@@ -41,13 +41,16 @@ enum Mode
 {
     ModeSparsePost,
     ModeSparsePostBitfield,
+    ModeSparsePostSquareShared,
     ModeMax,
 };
 
 
 const char *const s_ModeNames[] = {
     "Sparse Post",
-    "Sparse Post Bitfield"};
+    "Sparse Post Bitfield",
+    "Sparse Post Square Shared"
+};
 
 //------------------------------------------------------------------------
 // SparseMatrix
@@ -242,8 +245,8 @@ __global__ void sparsePostIndividualWeight(const unsigned int *d_rowLength, cons
                                            const float *d_weights, float *d_outCurrents)
 {
     extern __shared__ unsigned int s_buffer[];
-    unsigned int *s_spike = &s_buffer[0];
-    unsigned int *s_rowLength = &s_buffer[blockDim.x];
+    unsigned int *s_spike = s_buffer;
+    unsigned int *s_rowLength = s_buffer + blockDim.x;
 
     const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
     const unsigned int batch = blockIdx.y;
@@ -367,7 +370,69 @@ __global__ void sparsePostBitfieldIndividualWeight(const unsigned int *d_rowLeng
         preNeuronID--;
     }
 }
+//-----------------------------------------------------------------------------
+__global__ void sparsePostSquareShared(const unsigned int *d_rowLength, const unsigned int *d_indices, 
+                                       unsigned int numPre, unsigned int numPost, unsigned int maxRowLength,
+                                       const unsigned int *d_numInSpikes, const unsigned int *d_inSpikes,
+                                       float *d_weights, float *d_outCurrents)
+{
+    extern __shared__ unsigned int s_buffer[];
+    unsigned int *s_spike = s_buffer;
+    unsigned int *s_rowLength = s_buffer + blockDim.x;
+    float *s_output = reinterpret_cast<float*>(s_buffer + (blockDim.x * 2));
 
+    const unsigned int id = threadIdx.x + (blockIdx.x * blockDim.x);
+    const unsigned int batch = blockIdx.y;
+
+    // Calculate number of blocks (dictated by shared memory) spikes need to be processed in
+    const unsigned int numSpikes = d_numInSpikes[batch];
+    const unsigned int numSpikeBlocks = (numSpikes + blockDim.x - 1) / blockDim.x;
+    const unsigned int preBatchOffset = numPre * batch;
+    const unsigned int postBatchOffset = numPost * batch;
+    
+    // Zero shared memory
+    const unsigned int neuronIDX = threadIdx.x + (threadIdx.y * blockDim.x);
+    if(neuronIDX < numPost) {
+        s_output[neuronIDX] = 0.0f;
+    }
+    
+    // Loop through spikes blocks
+    for (unsigned int b = 0; b < numSpikeBlocks; b++) {
+        // Determine how many spikes are in this block
+        const unsigned int numSpikesInBlock = (b == (numSpikeBlocks - 1))
+            ? ((numSpikes - 1) % blockDim.x) + 1 : blockDim.x;
+
+        // Use first row of threads in block to make coalesced read of spikes and row lengths into shared memory
+        if (threadIdx.y == 0 && threadIdx.x < numSpikesInBlock) {
+            const unsigned int i = d_inSpikes[preBatchOffset + (b * blockDim.x) + threadIdx.x];
+            s_spike[threadIdx.x] = i;
+            s_rowLength[threadIdx.x] = d_rowLength[i];
+        }
+        __syncthreads();
+
+        // If this thread isn't off the edge of the ragged array
+        if(id < maxRowLength) {
+            // If there is a spike for this thread to process
+            if(threadIdx.y < numSpikesInBlock) {
+                // If there is a synapse for this thread to process
+                if(id < s_rowLength[threadIdx.y]) {
+                    // Get postsynaptic index
+                    const unsigned int synAddress = (s_spike[threadIdx.y] * maxRowLength) + id;
+                    const unsigned int j = d_indices[synAddress];
+                    
+                    // Add input current
+                    atomicAdd(&s_output[j], d_weights[synAddress]);
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+    __syncthreads();
+    if(neuronIDX < numPost) {
+        atomicAdd(&d_outCurrents[postBatchOffset + neuronIDX], s_output[neuronIDX]);
+    }
+}
 //-----------------------------------------------------------------------------
 // Host functions
 //-----------------------------------------------------------------------------
@@ -591,7 +656,7 @@ int main(int argc, char *argv[])
         if(argc > 2) {
             numPre = numPost = std::stoul(argv[2]);
         }
-        // If additional parameters are specified, read number of postsynaptic blocks
+        // If additional parameters are specified, read batch size
         if(argc > 3) {
             batchSize = std::stoul(argv[3]);
         }
@@ -642,7 +707,7 @@ int main(int argc, char *argv[])
         HostDeviceArray<unsigned int> poissonSpikes;
         HostDeviceArray<uint32_t> poissonSpikeBits;
 
-        if(mode == ModeSparsePost) {
+        if(mode == ModeSparsePost || mode == ModeSparsePostSquareShared) {
             // Create arrays to hold poisson spike count
             poissonNumSpikes = allocateHostDevice<unsigned int>(batchSize);
 
@@ -702,7 +767,7 @@ int main(int argc, char *argv[])
                     const dim3 threads(blockSize, 1);
                     const dim3 grid(preBlocks, batchSize);
 
-                    if(mode == ModeSparsePost) {
+                    if(mode == ModeSparsePost || mode == ModeSparsePostSquareShared) {
                         // Zero spike count
                         std::fill_n(&poissonNumSpikes.first[0], batchSize, 0);
                         hostToDeviceCopy(poissonNumSpikes, batchSize);
@@ -719,7 +784,6 @@ int main(int argc, char *argv[])
                         poissonBitfield<<<grid, threads>>>(numPre, poissonMeanISI.second, d_poissonState,
                                                            d_poissonTimeToSpike, poissonSpikeBits.second);
                     }
-
                 }
                 CHECK_CUDA_ERRORS(cudaEventRecord(kernelStartEvent));
                 const unsigned int numPostSynapseBlocks = ceilDivide(sparseMatrix.maxRowLength, blockSize);
@@ -738,6 +802,17 @@ int main(int argc, char *argv[])
                     sparsePostBitfieldIndividualWeight<<<grid, threads>>>(sparseMatrix.rowLength.second, sparseMatrix.indices.second, 
                                                                           batchSize, numPre, numPost, sparseMatrix.maxRowLength,
                                                                           poissonSpikeBits.second, weights.second, outCurrents.second);
+                }
+                else if(mode == ModeSparsePostSquareShared) {
+                    assert(numPost <= (blockSize * blockSize));
+                    const dim3 threads(blockSize, blockSize);
+                    const dim3 grid(numPostSynapseBlocks, batchSize);
+                    const unsigned int sharedBytes = (blockSize * 2 * sizeof(unsigned int)) + (blockSize * blockSize * sizeof(float));
+                    
+                    sparsePostSquareShared<<<grid, threads, sharedBytes>>>(sparseMatrix.rowLength.second, sparseMatrix.indices.second, 
+                                                                           numPre, numPost, sparseMatrix.maxRowLength,
+                                                                           poissonNumSpikes.second, poissonSpikes.second,
+                                                                           weights.second, outCurrents.second);
                 }
 
                 CHECK_CUDA_ERRORS(cudaEventRecord(kernelEndEvent));
