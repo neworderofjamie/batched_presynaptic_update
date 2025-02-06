@@ -1,6 +1,6 @@
 
 NVCC           :="/usr/local/cuda/bin/nvcc"
-NVCCFLAGS      :=-lineinfo -c -x cu -arch sm_30 -std=c++11 -O3
+NVCCFLAGS      :=-lineinfo -c -x cu -arch sm_86 -std=c++17 -O3
 
 all: kernel
 
